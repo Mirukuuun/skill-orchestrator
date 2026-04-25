@@ -1,3 +1,5 @@
+**中文** · [English](README.en.md)
+
 # Skill Orchestrator
 
 **Claude Code skill 的声明式编排引擎——用 markdown 把多个 skill 串成 workflow，自动跑、自动恢复、自动兜底。**
