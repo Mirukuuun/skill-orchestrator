@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# lint <workflow.md>
+#
+# Workflow 配置文件校验器。零依赖（纯 bash + grep + sed + awk）。
+#
+# 覆盖：
+#   结构层 - frontmatter 存在闭合 / 必填字段 / name 等于文件名 / fallback_gate 仅 human
+#          / max_goto_loops 是正整数 / ## Steps 存在 / 每 H3 下恰 1 个 yaml block
+#          / yaml block 闭合 / step id 唯一
+#   语义层 - skill 必填+存在性 / mode ∈ {main,subagent} / gate_after.kind ∈ {human,auto}
+#          / on_fail ∈ {abort, ask_user, retry:<N>} / decision.field 非嵌套
+#          / goto 目标存在 / {{params.X}} 引用在 frontmatter params 里声明
+#
+# 不覆盖：YAML 语法错（由 engine §0.2 parse 时自然发现）
+#
+# 用法：lint <path-to-workflow.md>
+# 退出：0=合法，1=lint 失败，2=使用错误
+
+set -u
+
+ERR=0
+TMPDIR=""
+
+die() {
+    echo "LINT ERROR: $*" >&2
+    ERR=1
+}
+
+cleanup() {
+    [ -n "$TMPDIR" ] && rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+# ============================================================
+# 入口检查
+# ============================================================
+if [ $# -ne 1 ]; then
+    echo "usage: $0 <workflow.md>" >&2
+    exit 2
+fi
+
+ORIG_FILE="$1"
+
+if [ ! -f "$ORIG_FILE" ]; then
+    echo "LINT ERROR: file not found: $ORIG_FILE" >&2
+    exit 1
+fi
+
+TMPDIR=$(mktemp -d -t skill-orch-lint-XXXXXX 2>/dev/null || mktemp -d)
+BASENAME=$(basename "$ORIG_FILE" .md)
+
+# BOM-aware：若文件以 UTF-8 BOM (EF BB BF) 开头，生成去 BOM 副本供后续步骤使用
+FIRST3=$(head -c 3 "$ORIG_FILE" | od -An -tx1 | tr -d ' \n\t')
+if [ "$FIRST3" = "efbbbf" ]; then
+    FILE="$TMPDIR/stripped.md"
+    tail -c +4 "$ORIG_FILE" > "$FILE"
+else
+    FILE="$ORIG_FILE"
+fi
+
+# ============================================================
+# 1. 分离 frontmatter 和 body
+# ============================================================
+if ! head -1 "$FILE" | grep -qE '^---[[:space:]]*$'; then
+    echo "LINT ERROR: file does not start with frontmatter '---'" >&2
+    exit 1
+fi
+
+FM_END=$(awk 'NR>1 && /^---[[:space:]]*$/ { print NR; exit }' "$FILE")
+if [ -z "$FM_END" ]; then
+    echo "LINT ERROR: frontmatter not closed (second '---' missing)" >&2
+    exit 1
+fi
+
+FRONTMATTER="$TMPDIR/frontmatter"
+BODY="$TMPDIR/body"
+sed -n "2,$((FM_END-1))p" "$FILE" > "$FRONTMATTER"
+sed -n "$((FM_END+1)),\$p" "$FILE" > "$BODY"
+
+# ============================================================
+# 2. Frontmatter 字段校验
+# ============================================================
+for field in name description autoteam_version; do
+    if ! grep -qE "^${field}:" "$FRONTMATTER"; then
+        die "frontmatter missing required field: $field"
+    fi
+done
+
+# 提取裸值辅助：去掉前后空白、去除首尾单/双引号
+_extract_top_value() {
+    grep -E "^$1:" "$FRONTMATTER" | head -1 \
+        | sed -E "s/^$1:[[:space:]]*//; s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//"
+}
+
+NAME=$(_extract_top_value "name")
+if [ "$NAME" != "$BASENAME" ]; then
+    die "frontmatter 'name: $NAME' must equal filename '$BASENAME'"
+fi
+
+FB=$(_extract_top_value "fallback_gate")
+if [ -n "$FB" ] && [ "$FB" != "human" ]; then
+    die "fallback_gate must be 'human' in MVP, got '$FB'"
+fi
+
+MGL=$(_extract_top_value "max_goto_loops")
+if [ -n "$MGL" ] && ! echo "$MGL" | grep -qE '^[1-9][0-9]*$'; then
+    die "max_goto_loops must be positive integer, got '$MGL'"
+fi
+
+# Inline `params: {...}` 形态在 MVP shell lint 不支持——显式拒绝
+# 合法 YAML 允许,但 shell 精确 parse inline flow-map 超出 MVP ROI
+# 规则: 若存在 `params: {...}` 或 `params: {` 开头 → 报结构性错误,要求改 block form
+if grep -qE '^params:[[:space:]]*\{' "$FRONTMATTER"; then
+    die "inline params '{...}' not supported by MVP lint; use block form (params: / indented <name>: / indented type: ...)"
+fi
+
+# 提取 params 下**第一级缩进**的 key 名(block form only)
+# 结构: params:\n  <key1>:\n    type: ...  ← type/required/default 是嵌套字段,不算 param 名
+# 策略: 记住第一个进入 params: 的 key 缩进宽度,之后只抓同样宽度的 key
+PARAMS_FILE="$TMPDIR/params"
+awk '
+    /^params:[[:space:]]*$/      { in_params=1; first_indent=""; next }
+    in_params && /^[^[:space:]]/ { in_params=0 }
+    in_params && /^[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*:/ {
+        match($0, /^[[:space:]]+/)
+        indent = substr($0, RSTART, RLENGTH)
+        if (first_indent == "") first_indent = indent
+        if (indent == first_indent) {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/:.*$/, "", line)
+            print line
+        }
+    }
+' "$FRONTMATTER" | sort -u > "$PARAMS_FILE"
+
+# ============================================================
+# 3. Body: ## Steps 存在
+# ============================================================
+if ! grep -qE '^## Steps([[:space:]]|$)' "$BODY"; then
+    die "missing '## Steps' section in body"
+fi
+
+# ============================================================
+# 4. awk 状态机 parse body：提取 H3 + 把每个 step 的 yaml 块写入临时文件
+# ============================================================
+STEP_IDS_FILE="$TMPDIR/step-ids"
+: > "$STEP_IDS_FILE"
+
+awk -v TMPDIR="$TMPDIR" -v STEP_IDS_FILE="$STEP_IDS_FILE" '
+BEGIN { state = "NONE"; cur = ""; yc = 0; yaml_file = "/dev/null"; aerr = 0 }
+
+function awk_die(msg) { print "LINT ERROR: " msg > "/dev/stderr"; aerr = 1 }
+
+function settle() {
+    if (state == "IN_YAML")           awk_die("step \"" cur "\": unclosed ```yaml block")
+    else if (cur != "") {
+        if (yc == 0)                  awk_die("step \"" cur "\": no ```yaml fenced block")
+        else if (yc > 1)              awk_die("step \"" cur "\": multiple ```yaml blocks (use ```yml-example for samples)")
+    }
+}
+
+/^## Steps([[:space:]]|$)/ { state = "IN_STEPS"; next }
+
+/^## / {
+    if (state == "IN_STEP") settle()
+    state = "NONE"; cur = ""; yc = 0; next
+}
+
+/^### / && (state == "IN_STEPS" || state == "IN_STEP") {
+    if (state == "IN_STEP") settle()
+    id = $0
+    sub(/^### [[:space:]]*/, "", id)
+    sub(/[[:space:]]*$/, "", id)
+    if (id in seen) awk_die("duplicate step id: \"" id "\"")
+    seen[id] = 1
+    cur = id
+    yc = 0
+    yaml_file = TMPDIR "/step-" id ".yaml"
+    print id >> STEP_IDS_FILE
+    state = "IN_STEP"
+    next
+}
+
+/^```yaml[[:space:]]*$/ && state == "IN_STEP" { state = "IN_YAML"; yc++; next }
+/^```[[:space:]]*$/     && state == "IN_YAML" { state = "IN_STEP"; next }
+
+state == "IN_YAML" { print $0 >> yaml_file }
+
+END {
+    if (state == "IN_STEP" || state == "IN_YAML") settle()
+    exit aerr
+}
+' "$BODY" || ERR=1
+
+if [ ! -s "$STEP_IDS_FILE" ]; then
+    die "no H3 steps found under '## Steps'"
+fi
+
+# 如果结构层已出错，跳过语义层（避免错误上错误）
+if [ $ERR -ne 0 ]; then
+    exit 1
+fi
+
+# ============================================================
+# 5. 对每个 step 做语义层校验
+# ============================================================
+# yaml 块里提取字段值：过滤匹配行，取首个，去空白/引号
+_extract_yaml_field() {
+    # $1=file, $2=field name, $3=缩进要求（^[[:space:]]* 或 ^[[:space:]]+）
+    local file="$1" field="$2" indent="${3:-^[[:space:]]*}"
+    grep -E "${indent}${field}:" "$file" | head -1 \
+        | sed -E "s/^[[:space:]]*${field}:[[:space:]]*//; s/[[:space:]]*$//; s/^['\"]//; s/['\"]$//"
+}
+
+while IFS= read -r SID; do
+    [ -z "$SID" ] && continue
+    YF="$TMPDIR/step-${SID}.yaml"
+    [ -f "$YF" ] || continue
+
+    # --- skill: 必填 + 存在性 ---
+    SKILL=$(_extract_yaml_field "$YF" "skill")
+    if [ -z "$SKILL" ]; then
+        die "step \"$SID\": missing 'skill:' field"
+    else
+        SKILL_MD="$HOME/.claude/skills/${SKILL}/SKILL.md"
+        if [ ! -f "$SKILL_MD" ]; then
+            die "step \"$SID\": skill '$SKILL' not found at $SKILL_MD"
+        fi
+    fi
+
+    # --- mode: 必填 + ∈ {main, subagent} ---
+    MODE=$(_extract_yaml_field "$YF" "mode")
+    if [ -z "$MODE" ]; then
+        die "step \"$SID\": missing 'mode:' field (required)"
+    elif [ "$MODE" != "main" ] && [ "$MODE" != "subagent" ]; then
+        die "step \"$SID\": mode must be 'main' or 'subagent', got '$MODE'"
+    fi
+
+    # --- gate_after.kind: 若 gate_after 存在则 kind 必填 + ∈ {human, auto} ---
+    if grep -qE '^[[:space:]]*gate_after:' "$YF"; then
+        KIND=$(_extract_yaml_field "$YF" "kind" '^[[:space:]]+')
+        if [ -z "$KIND" ]; then
+            die "step \"$SID\": gate_after present but missing 'kind:' (required when gate_after exists)"
+        elif [ "$KIND" != "human" ] && [ "$KIND" != "auto" ]; then
+            die "step \"$SID\": gate_after.kind must be 'human' or 'auto', got '$KIND'"
+        fi
+    fi
+
+    # --- on_fail: 必填 + ∈ {abort, ask_user, retry:<N>} ---
+    OF=$(_extract_yaml_field "$YF" "on_fail")
+    if [ -z "$OF" ]; then
+        die "step \"$SID\": missing 'on_fail:' field (required)"
+    elif ! echo "$OF" | grep -qE '^(abort|ask_user|retry:[1-9][0-9]*)$'; then
+        die "step \"$SID\": on_fail must be 'abort' | 'ask_user' | 'retry:<N>', got '$OF'"
+    fi
+
+    # --- decision.field 非嵌套（不含 .）---
+    if grep -qE '^[[:space:]]*decision:' "$YF"; then
+        FIELD=$(_extract_yaml_field "$YF" "field" '^[[:space:]]+')
+        if [ -n "$FIELD" ] && echo "$FIELD" | grep -q '\.'; then
+            die "step \"$SID\": decision.field must be flat root-level, got nested '$FIELD' (MVP 不支持嵌套路径)"
+        fi
+    fi
+
+    # --- goto:<target> 目标存在 ---
+    for TARGET in $(grep -oE 'goto:[a-zA-Z0-9_-]+' "$YF" | sed 's/^goto://' | sort -u); do
+        if ! grep -qxF "$TARGET" "$STEP_IDS_FILE"; then
+            die "step \"$SID\": goto target '$TARGET' not found in workflow steps"
+        fi
+    done
+
+    # --- {{params.X}} 引用必须在 frontmatter params 声明 ---
+    for REF in $(grep -oE '\{\{params\.[a-zA-Z_][a-zA-Z0-9_]*\}\}' "$YF" | sed -E 's/^\{\{params\.//; s/\}\}$//' | sort -u); do
+        if [ ! -s "$PARAMS_FILE" ] || ! grep -qxF "$REF" "$PARAMS_FILE"; then
+            die "step \"$SID\": template var {{params.$REF}} not declared in frontmatter params"
+        fi
+    done
+
+done < "$STEP_IDS_FILE"
+
+# ============================================================
+# 6. 结果
+# ============================================================
+if [ $ERR -ne 0 ]; then
+    exit 1
+fi
+
+COUNT=$(wc -l < "$STEP_IDS_FILE" | tr -d ' ')
+echo "OK: $COUNT step(s)"
+exit 0
